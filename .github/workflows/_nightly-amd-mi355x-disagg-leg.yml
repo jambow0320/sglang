@@ -82,11 +82,15 @@ jobs:
           fi
 
       - name: Launch MI355X disagg benchmark
-        # Covers the salloc wait plus TIME_LIMIT (2h30m) of run time. The caller
-        # sizes its groups to the cluster so a leg is not dispatched while the
-        # nodes it needs are held by another leg; a leg that still has to queue
-        # eats into this budget.
-        timeout-minutes: 180
+        # Covers the salloc wait plus TIME_LIMIT (2h30m) of run time, so this
+        # budget minus 150 minutes is how long a leg may sit in the Slurm queue.
+        # The caller sizes its groups to the cluster, so CI never queues behind
+        # itself; the headroom is for the people who share the partition. At 180
+        # that headroom was 30 minutes, which a single interactive job can
+        # exhaust -- and the leg then reports a benchmark failure for a
+        # benchmark that never ran. 300 gives 2h30m instead. A genuinely stuck
+        # leg is still bounded by TIME_LIMIT, which salloc enforces.
+        timeout-minutes: 300
         env:
           # Manual dispatch input wins; otherwise the latest image the caller's
           # setup job resolved; otherwise the launcher falls back to the recipe

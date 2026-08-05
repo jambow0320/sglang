@@ -36,6 +36,29 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Scheduled runs need no approval. Manual runs are gated by the mi355x-ci
+  # environment so an individual cannot queue arbitrary work onto the shared
+  # 4-node amd-sglang partition, which CI and people use at the same time.
+  # Mirrors the gb200-ci gate in nightly-72-gpu-gb200.yml.
+  #
+  # This is a separate job rather than `environment:` on the benchmark groups
+  # because those call a reusable workflow (which cannot carry `environment:`),
+  # and because gating each matrix leg would demand one approval per leg
+  # instead of one per run. setup stays ungated so the available config names
+  # are still listed while approval is pending.
+  #
+  # Until an admin adds required reviewers to the mi355x-ci environment this
+  # job just passes, so merging it changes nothing on its own.
+  # ---------------------------------------------------------------------------
+  gate-dispatch:
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: mi355x-ci
+    steps:
+      - name: Approved
+        run: echo "Manual dispatch approved for the shared amd-sglang partition."
+
+  # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
   # per recipe YAML for runner=mi355x, split into the paired and solo groups by
   # the allocation size generate_matrix.py reads out of each recipe. To
@@ -115,10 +138,13 @@ jobs:
   # 2-up and a second runner on the label is what actually doubles throughput.
   benchmark-paired:
     name: ${{ matrix.config.name }}
-    needs: setup
+    needs: [setup, gate-dispatch]
+    # gate-dispatch is skipped on schedule, so accept skipped as well as success
+    # -- otherwise the nightly would never reach the cluster.
     if: |
       always() && github.repository == 'sgl-project/sglang'
       && needs.setup.result == 'success'
+      && (needs.gate-dispatch.result == 'success' || needs.gate-dispatch.result == 'skipped')
       && needs.setup.outputs.matrix_paired != '[]'
     strategy:
       fail-fast: false
@@ -141,10 +167,11 @@ jobs:
   # recipe should not cost the rest of the nightly.
   benchmark-solo:
     name: ${{ matrix.config.name }}
-    needs: [setup, benchmark-paired]
+    needs: [setup, gate-dispatch, benchmark-paired]
     if: |
       always() && github.repository == 'sgl-project/sglang'
       && needs.setup.result == 'success'
+      && (needs.gate-dispatch.result == 'success' || needs.gate-dispatch.result == 'skipped')
       && needs.setup.outputs.matrix_solo != '[]'
     strategy:
       fail-fast: false
