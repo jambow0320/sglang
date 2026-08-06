@@ -49,7 +49,9 @@ pub async fn serve(
     shutdown: flume::Receiver<()>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
-    let prefill_worker_pool = pd_lb::PrefillWorkerPool::from_server_args(&server_args);
+    let prefill_worker_pool = pd_lb::PrefillWorkerPool::try_from(server_args.as_ref())
+        .ok()
+        .map(Arc::new);
     let state = AppState {
         senders,
         egress_buf,

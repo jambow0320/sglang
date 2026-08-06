@@ -160,7 +160,7 @@ async fn generate(
     // falls through untouched, exactly like a decode node without the LB.
     let forward = match &state.prefill_worker_pool {
         Some(pool) if !super::pd_lb::has_bootstrap(&value) => pool.pick().map(|endpoint| {
-            super::pd_lb::inject_generate(&mut value, &endpoint);
+            super::pd_lb::inject_bootstrap_params(&mut value, &endpoint);
             (pool.clone(), endpoint)
         }),
         _ => None,

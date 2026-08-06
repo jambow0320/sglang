@@ -19,6 +19,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use rand::Rng;
+use serde::Deserialize;
 
 use crate::api_server::AppState;
 use crate::ids::Rid;
@@ -35,22 +36,13 @@ const ERROR_SNIPPET_CAP: usize = 2048;
 const RECOVERY_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One registered prefill endpoint: where the front door forwards the prefill
-/// copy, and the bootstrap pair it injects. Deserializes from its wire form —
-/// a URL string — through [`Self::parse`] (`try_from`), so a request body
-/// field typed as `PrefillEndpoint` is validated during deserialization.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+/// Prefill endpoint, parse from String.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub(crate) struct PrefillEndpoint {
-    /// `http://host:port` — scheme + authority, no trailing slash. The forward
-    /// path is appended verbatim (`{base_url}/generate`).
+    /// Scheme + authority, no trailing slash.
     base_url: String,
-    /// Injected as the request's `bootstrap_host`: the URL's hostname, brackets
-    /// kept for IPv6 (mini_lb `maybe_wrap_ipv6_address` parity — the decode
-    /// scheduler joins it with the port to reach the prefill registry).
     bootstrap_host: String,
-    /// Injected as `bootstrap_port`: always the URL's own port — a rust-server
-    /// prefill serves the KV bootstrap registry on its api port.
     bootstrap_port: i64,
 }
 
@@ -62,14 +54,8 @@ impl TryFrom<String> for PrefillEndpoint {
 }
 
 impl PrefillEndpoint {
-    /// Parse one registration entry: a plain `http://host:port` URL
-    /// (syntax via `http::Uri` — axum's own URI type, no extra dependency).
-    /// The policy checks are ours: plain HTTP only (the forward client has no
-    /// TLS connector), an explicit port (a defaulted port 80 is never what a
-    /// PD deployment means; the port doubles as the bootstrap port since
-    /// rust-server prefill aliases the KV bootstrap registry onto its api
-    /// port), and no path or query.
-    pub(crate) fn parse(entry: &str) -> Result<Self, String> {
+    /// Parse one registration entry, no additional bootstrap port.
+    fn parse(entry: &str) -> Result<Self, String> {
         let uri: axum::http::Uri = entry
             .trim()
             .parse()
@@ -93,9 +79,7 @@ impl PrefillEndpoint {
                 "prefill url '{entry}' must include an explicit port"
             ));
         };
-        // `bootstrap_host` needs IPv6 brackets kept (mini_lb
-        // `maybe_wrap_ipv6_address` parity — the decode scheduler joins
-        // host:port to reach the registry); `Uri::host()` may strip them.
+        // ipv6 hosts keep their brackets.
         let bootstrap_host = if host.contains(':') && !host.starts_with('[') {
             format!("[{host}]")
         } else {
@@ -109,58 +93,48 @@ impl PrefillEndpoint {
     }
 }
 
-/// A registered prefill worker plus its live health mark (see the module
-/// docs on auto-recovery).
+/// A registered prefill worker plus its live health mark.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Registration {
     endpoint: PrefillEndpoint,
-    /// Cleared when a forward fails at the transport level (worker presumed
-    /// down); restored by a successful forward, a `/health` probe, or
-    /// re-registration.
     healthy: bool,
 }
 
-/// The prefill endpoints the decode front door forwards to, plus the shared
-/// pooled HTTP client. Present on every decode-mode rust server; the endpoint
-/// list starts empty and is managed via the admin API.
+/// The prefill workers this decode api server forwards to, plus the shared
+/// pooled HTTP client.
 pub(crate) struct PrefillWorkerPool {
-    /// Copy-on-write: the list is tiny and updated only by rare admin calls
-    /// and health flips, while every unrouted request reads it — so reads
-    /// take a lock-free snapshot and each write swaps in a freshly built list.
+    /// Copy-on-write prefill endpoint list.
     endpoints: ArcSwap<Vec<Registration>>,
+    /// Pooled outbound HTTP client.
     client: Client<HttpConnector, Full<Bytes>>,
-    /// Deadline for one whole forward (connect + request + body drain) —
-    /// mini_lb's `request_timeout_secs` analogue.
+    /// Deadline for one whole forward.
     timeout: Duration,
 }
 
-impl PrefillWorkerPool {
-    /// `Some` on every decode node, starting empty — the admin API populates
-    /// the endpoint list at runtime.
-    pub(crate) fn from_server_args(args: &ServerArgs) -> Option<Arc<Self>> {
+/// Constructible on every decode node, starting empty.
+impl TryFrom<&ServerArgs> for PrefillWorkerPool {
+    // No error message need to return.
+    type Error = ();
+
+    fn try_from(args: &ServerArgs) -> Result<Self, Self::Error> {
         //TODO: only decode check is not enough
         if args.disaggregation_mode != "decode" {
-            return None;
+            return Err(());
         }
         let timeout = Duration::from_secs(crate::environ::env_u64(
             "SGLANG_PD_LB_PREFILL_TIMEOUT_SECS",
             1800,
         ));
-        Some(Arc::new(Self {
+        Ok(Self {
             endpoints: ArcSwap::from_pointee(Vec::new()),
             client: Client::builder(TokioExecutor::new()).build_http(),
             timeout,
-        }))
+        })
     }
+}
 
-    /// Random policy over the current registration set, like mini_lb — the
-    /// only policy the mini LB supports. Healthy workers are preferred; with
-    /// every worker marked down the pick FAILS OPEN to any registered one:
-    /// the forward's failure is a clearer diagnostic than a room-less 400,
-    /// and a success puts that worker straight back in rotation. `None` only
-    /// while the pool is empty (the caller falls through to the
-    /// unrouted-request behavior). Returns a clone so a concurrent
-    /// deregistration cannot invalidate an in-flight pick.
+impl PrefillWorkerPool {
+    /// Random policy over the current registration set.
     pub(crate) fn pick(&self) -> Option<PrefillEndpoint> {
         let entries = self.endpoints.load();
         if entries.is_empty() {
@@ -183,10 +157,7 @@ impl PrefillWorkerPool {
         self.endpoints.load_full()
     }
 
-    /// Flip a worker's health mark; `false` takes it out of rotation. No-op
-    /// (returns false) when the URL is unknown or already in the desired
-    /// state — the pre-check keeps the hot success path from swapping a fresh
-    /// list on every forward.
+    /// Flip a worker's health mark.
     fn set_health(&self, base_url: &str, healthy: bool) -> bool {
         if !self
             .endpoints
@@ -218,9 +189,8 @@ impl PrefillWorkerPool {
     }
 
     /// One recovery pass: probe every down worker and revive the ones
-    /// answering `/health` with a 2xx. Factored out of [`recovery_sweeper`]'s
-    /// timer loop so tests can drive a pass directly.
-    pub(crate) async fn revive_down_workers(&self) {
+    /// answering `/health` with a 2xx.
+    async fn revive_down_workers(&self) {
         let down: Vec<String> = self
             .endpoints
             .load()
@@ -229,16 +199,14 @@ impl PrefillWorkerPool {
             .map(|r| r.endpoint.base_url.clone())
             .collect();
         for url in down {
-            if self.probe_health(&url).await && self.set_health(&url, true) {
-                tracing::info!(%url, "prefill worker recovered (/health passed); back in rotation");
+            if self.health_check(&url).await && self.set_health(&url, true) {
+                tracing::info!(%url, "prefill worker recovered.");
             }
         }
     }
 
-    /// GET `{base_url}/health`, 2xx within the probe deadline = alive. The
-    /// response body is dropped unread — it is a trivial probe, not a request
-    /// the worker committed work to.
-    async fn probe_health(&self, base_url: &str) -> bool {
+    /// Check the prefill worker is healthy or not.
+    async fn health_check(&self, base_url: &str) -> bool {
         let Ok(request) = Request::get(format!("{base_url}/health")).body(Full::new(Bytes::new()))
         else {
             return false;
@@ -249,13 +217,7 @@ impl PrefillWorkerPool {
         )
     }
 
-    /// Idempotent by `base_url`: a re-registration updates the bootstrap port
-    /// in place — and revives a down worker (registering is an operator's
-    /// assertion that the worker is back). Returns whether the endpoint was
-    /// newly added.
-    ///
-    /// `rcu` re-runs the closure on write contention, so the flag from its
-    /// final (winning) run is the one returned.
+    /// Register the prefill worker.
     pub(crate) fn register(&self, endpoint: PrefillEndpoint) -> bool {
         let mut added = false;
         self.endpoints.rcu(|current| {
@@ -282,7 +244,7 @@ impl PrefillWorkerPool {
         added
     }
 
-    /// Returns whether the URL was registered.
+    /// Deregister the prefill worker.
     pub(crate) fn deregister(&self, base_url: &str) -> bool {
         let mut removed = false;
         self.endpoints.rcu(|current| {
@@ -297,27 +259,23 @@ impl PrefillWorkerPool {
         removed
     }
 
-    /// POST `payload` to `url` and drain the response to EOF. The drain is
-    /// load-bearing even for a 200: dropping the connection early is a client
-    /// disconnect on the prefill server, which abort-kills the prefill work mid
-    /// KV transfer (mini_lb holds its prefill response open for the same
-    /// reason — including the SSE response of a forwarded `stream: true` body).
-    async fn forward(&self, url: &str, payload: Bytes) -> Result<(), ForwardFailure> {
+    /// Forward a request to the prefill worker.
+    async fn forward(&self, url: &str, payload: Bytes) -> Result<(), ForwardFailureReason> {
         let request = Request::post(url)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(payload))
-            .map_err(|e| ForwardFailure::worker_alive(e.to_string()))?;
+            .map_err(|e| ForwardFailureReason::worker_alive(e.to_string()))?;
         let response = self
             .client
             .request(request)
             .await
-            .map_err(|e| ForwardFailure::worker_down(e.to_string()))?;
+            .map_err(|e| ForwardFailureReason::worker_down(e.to_string()))?;
         let status = response.status();
         let mut body = response.into_body();
         let mut error_snippet = Vec::new();
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|e| {
-                ForwardFailure::worker_down(format!("reading prefill response: {e}"))
+                ForwardFailureReason::worker_down(format!("reading prefill response: {e}"))
             })?;
             if !status.is_success()
                 && error_snippet.len() < ERROR_SNIPPET_CAP
@@ -330,7 +288,7 @@ impl PrefillWorkerPool {
         if status.is_success() {
             Ok(())
         } else {
-            Err(ForwardFailure::worker_alive(format!(
+            Err(ForwardFailureReason::worker_alive(format!(
                 "status {status}: {}",
                 String::from_utf8_lossy(&error_snippet)
             )))
@@ -338,16 +296,17 @@ impl PrefillWorkerPool {
     }
 }
 
-/// Why a forward failed. `worker_down` separates transport-level failures
-/// (connect refused/reset, broken response body — the worker is presumed dead
-/// and leaves rotation) from failures where the worker answered (an HTTP
-/// error status — it stays in rotation).
-struct ForwardFailure {
+/// Forward to prefill worker failure reason.
+/// Display renders the human message; `worker_down` stays out of it — the
+/// classification is logged by the mark-down warn, not repeated per line.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct ForwardFailureReason {
     message: String,
     worker_down: bool,
 }
 
-impl ForwardFailure {
+impl ForwardFailureReason {
     fn worker_down(message: String) -> Self {
         Self {
             message,
@@ -362,9 +321,7 @@ impl ForwardFailure {
     }
 }
 
-/// Fire the prefill copy. Runs detached (the local decode path answers the
-/// client); on any failure every local rid gets a [`DetokMsg::Fail`] →
-/// scheduler abort + terminal error to the client.
+/// Async run the the prefill request.
 pub(crate) fn spawn_forward(
     pool: Arc<PrefillWorkerPool>,
     endpoint: PrefillEndpoint,
@@ -378,8 +335,7 @@ pub(crate) fn spawn_forward(
         let url = format!("{}{}", endpoint.base_url, path);
         let failure = match tokio::time::timeout(pool.timeout, pool.forward(&url, payload)).await {
             Ok(Ok(())) => {
-                // A fail-open pick that succeeds is proof of life — put the
-                // worker back in rotation without waiting for the sweeper.
+                // When succeeded, put the worker back in rotation without waiting for the sweeper.
                 if pool.set_health(&endpoint.base_url, true) {
                     tracing::info!(url = %endpoint.base_url,
                         "prefill worker recovered (forward succeeded); back in rotation");
@@ -387,19 +343,19 @@ pub(crate) fn spawn_forward(
                 return;
             }
             Ok(Err(failure)) => failure,
-            // A deadline hit is ambiguous (a long stream drain lands here
-            // too), so the worker keeps its rotation slot — the /health
-            // sweeper stays the arbiter of liveness.
-            Err(_) => ForwardFailure::worker_alive(format!("timed out after {:?}", pool.timeout)),
+            // Timeout.
+            Err(_) => {
+                ForwardFailureReason::worker_alive(format!("timed out after {:?}", pool.timeout))
+            }
         };
         if failure.worker_down && pool.set_health(&endpoint.base_url, false) {
             tracing::warn!(url = %endpoint.base_url,
                 "prefill worker marked down; out of rotation until /health passes");
         }
-        tracing::error!(%url, error = %failure.message,
+        tracing::error!(%url, error = %failure,
             "prefill forward failed; aborting local decode request(s)");
         for rid in rids {
-            let message = format!("prefill forward to {url} failed: {}", failure.message);
+            let message = format!("prefill forward to {url} failed: {failure}");
             let _ = senders
                 .detok_for(&rid)
                 .send(DetokMsg::Fail { rid, message });
@@ -412,19 +368,15 @@ fn random_room() -> i64 {
     rand::rng().random_range(0..=i64::MAX)
 }
 
-/// Whether the request already carries PD routing (non-null `bootstrap_host`
-/// or `bootstrap_room`) — then the front door must stay out of the way. Key
-/// presence is checked structurally, before any typed parse, so a bypassed
-/// body is forwarded to the local pipeline byte-identical.
+/// Whether the request already carries PD routing.
 pub(crate) fn has_bootstrap(value: &serde_json::Value) -> bool {
     ["bootstrap_host", "bootstrap_room"]
         .iter()
         .any(|key| value.get(key).is_some_and(|v| !v.is_null()))
 }
 
-/// mini_lb `_get_request_batch_size`: a `/generate` body is a batch iff `text`
-/// is a list, or `input_ids` is a list of lists. `Some(n)` = batch of n.
-fn generate_batch_size(value: &serde_json::Value) -> Option<usize> {
+/// Get batsh size from the request body.
+fn get_batch_size(value: &serde_json::Value) -> Option<usize> {
     match value.get("text") {
         Some(serde_json::Value::Null) | None => {}
         Some(serde_json::Value::Array(items)) => return Some(items.len()),
@@ -441,12 +393,9 @@ fn generate_batch_size(value: &serde_json::Value) -> Option<usize> {
     }
 }
 
-/// Inject bootstrap params into a raw `/generate` body, byte-shaped like
-/// mini_lb: a batch gets per-item lists (same host/port broadcast, one fresh
-/// room per item), a single prompt gets scalars. A non-object body is left
-/// untouched for the typed parse to 400.
-pub(crate) fn inject_generate(value: &mut serde_json::Value, endpoint: &PrefillEndpoint) {
-    let batch = generate_batch_size(value);
+/// Inject bootstrap params into a raw `/generate` body.
+pub(crate) fn inject_bootstrap_params(value: &mut serde_json::Value, endpoint: &PrefillEndpoint) {
+    let batch = get_batch_size(value);
     let Some(object) = value.as_object_mut() else {
         return;
     };
@@ -467,13 +416,8 @@ pub(crate) fn inject_generate(value: &mut serde_json::Value, endpoint: &PrefillE
     object.insert("bootstrap_room".into(), room);
 }
 
-/// The scalar bootstrap params an OpenAI request resolves to — injected by
-/// this front door or supplied by an external router. The handlers expand the
-/// scalar room per choice as `room + index`, the same rule Python
-/// `_normalize_bootstrap_params` and `GenerateBody::into_requests` apply, so a
-/// rust prefill peer running the identical expansion on the forwarded scalar
-/// derives the same per-choice rooms.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+/// The scalar bootstrap params an OpenAI request resolves to.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct BootstrapParams {
     pub(crate) bootstrap_host: Option<String>,
     pub(crate) bootstrap_port: Option<i64>,
@@ -494,15 +438,7 @@ impl BootstrapParams {
     }
 }
 
-/// Resolve PD routing for an OpenAI request body. Returns the params to attach
-/// to the local per-choice requests, plus the forward target when this front
-/// door did the routing (an externally-routed request is never re-forwarded;
-/// an empty pool falls through unrouted).
-///
-/// Scalar-only intake: bootstrap fields sent as lists fail the typed parse and
-/// resolve to `None` fields — in PD mode the scheduler then 400-aborts the
-/// room-less request, which is the shape mini_lb's OpenAI path (always
-/// scalars) never produces.
+/// Resolve PD routing for an OpenAI request body.
 pub(crate) fn resolve_openai_bootstrap(
     pool: &Option<Arc<PrefillWorkerPool>>,
     value: &mut serde_json::Value,
@@ -510,7 +446,6 @@ pub(crate) fn resolve_openai_bootstrap(
     BootstrapParams,
     Option<(Arc<PrefillWorkerPool>, PrefillEndpoint)>,
 ) {
-    use serde::Deserialize;
     if has_bootstrap(value) {
         let params = BootstrapParams::deserialize(&*value).unwrap_or_default();
         return (params, None);
@@ -544,9 +479,7 @@ pub(crate) fn resolve_openai_bootstrap(
     (params, Some((pool.clone(), endpoint)))
 }
 
-/// Auto-recovery loop, spawned by `api_server::serve` alongside the pool and
-/// cancelled with the runtime: every [`RECOVERY_PROBE_INTERVAL`], probe each
-/// down worker's `/health` and put responders back in rotation.
+/// Auto-recovery loop.
 async fn recovery_sweeper(pool: Arc<PrefillWorkerPool>) {
     loop {
         tokio::time::sleep(RECOVERY_PROBE_INTERVAL).await;
@@ -559,8 +492,7 @@ async fn recovery_sweeper(pool: Arc<PrefillWorkerPool>) {
 // ---------------------------------------------------------------------------
 
 /// `GET/POST/DELETE /prefill_workers`, mounted only when the pool exists
-/// (decode nodes). The CLI flag seeds the list; this API is the live source of
-/// truth — registrations are in-memory and do not survive a restart.
+/// (decode nodes).
 fn routes() -> Router<AppState> {
     Router::new().route(
         "/prefill_workers",
@@ -576,16 +508,7 @@ pub(crate) fn router_and_sweeper(
     (routes(), recovery_sweeper(pool))
 }
 
-/// The routes are mounted iff the pool exists, so this only answers a request
-/// that raced a topology misconfiguration.
-fn not_front_door() -> Response {
-    json_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "this server is not a PD decode front door",
-    )
-}
-
-fn listing(pool: &PrefillWorkerPool) -> serde_json::Value {
+fn prefill_workers_json(pool: &PrefillWorkerPool) -> serde_json::Value {
     serde_json::json!({
         "prefill_workers": pool
             .list()
@@ -602,16 +525,15 @@ fn listing(pool: &PrefillWorkerPool) -> serde_json::Value {
 
 async fn list_prefill_workers(State(state): State<AppState>) -> Response {
     let Some(pool) = state.prefill_worker_pool.as_ref() else {
-        return not_front_door();
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server is not a PD decode",
+        );
     };
-    Json(listing(pool)).into_response()
+    Json(prefill_workers_json(pool)).into_response()
 }
 
-/// `{"url": "http://host:port"}` or `{"urls": [...]}`. Fields are typed
-/// [`PrefillEndpoint`]s: entries parse (and get policy-checked) during body
-/// deserialization, so a bad entry 400s the whole request before the handler
-/// runs — batch registration is atomic by construction.
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct PrefillWorkersBody {
     #[serde(default)]
     url: Option<PrefillEndpoint>,
@@ -630,15 +552,15 @@ async fn add_prefill_workers(
     body: Result<Json<PrefillWorkersBody>, JsonRejection>,
 ) -> Response {
     let Some(pool) = state.prefill_worker_pool.as_ref() else {
-        return not_front_door();
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server is not a PD decode",
+        );
     };
     let body = match body {
         Ok(Json(body)) => body,
         Err(rejection) => return json_error(StatusCode::BAD_REQUEST, &rejection.body_text()),
     };
-    // Entries arrived already parsed and policy-checked (typed
-    // `PrefillEndpoint` fields): one bad entry rejected the whole body above,
-    // so a partially-applied registration cannot happen.
     let endpoints: Vec<PrefillEndpoint> = body.into_entries().collect();
     if endpoints.is_empty() {
         return json_error(
@@ -657,7 +579,7 @@ async fn add_prefill_workers(
             tracing::info!(%url, "PD LB prefill endpoint updated");
         }
     }
-    let mut response = listing(pool);
+    let mut response = prefill_workers_json(pool);
     response["added"] = serde_json::json!(added);
     response["updated"] = serde_json::json!(updated);
     Json(response).into_response()
@@ -668,14 +590,15 @@ async fn remove_prefill_worker(
     body: Result<Json<PrefillWorkersBody>, JsonRejection>,
 ) -> Response {
     let Some(pool) = state.prefill_worker_pool.as_ref() else {
-        return not_front_door();
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this server is not a PD decode",
+        );
     };
     let body = match body {
         Ok(Json(body)) => body,
         Err(rejection) => return json_error(StatusCode::BAD_REQUEST, &rejection.body_text()),
     };
-    // The typed field already parsed (and thereby normalized — e.g. a
-    // trailing slash) the URL, so removal matches however it was written.
     let Some(endpoint) = body.url else {
         return json_error(StatusCode::BAD_REQUEST, "provide 'url'");
     };
@@ -687,7 +610,7 @@ async fn remove_prefill_worker(
         );
     }
     tracing::info!(url = %base_url, "PD LB prefill endpoint deregistered");
-    Json(listing(pool)).into_response()
+    Json(prefill_workers_json(pool)).into_response()
 }
 
 #[cfg(test)]
@@ -704,7 +627,7 @@ mod tests {
             &json!({"disaggregation_mode": "decode"}).to_string(),
         )
         .unwrap();
-        let pool = PrefillWorkerPool::from_server_args(&args).expect("decode node owns a pool");
+        let pool = Arc::new(PrefillWorkerPool::try_from(&args).expect("decode node owns a pool"));
         for url in urls {
             pool.register(PrefillEndpoint::parse(url).unwrap());
         }
@@ -760,7 +683,7 @@ mod tests {
             &json!({"disaggregation_mode": "prefill"}).to_string(),
         )
         .unwrap();
-        assert!(PrefillWorkerPool::from_server_args(&prefill_args).is_none());
+        assert!(PrefillWorkerPool::try_from(&prefill_args).is_err());
     }
 
     /// Runtime registration: idempotent by URL, deregistration by normalized
@@ -853,13 +776,13 @@ mod tests {
     /// Single-prompt `/generate` gets scalar injection, exactly mini_lb's
     /// shape; the room is in `[0, 2^63)`.
     #[test]
-    fn inject_generate_scalars_for_single_prompt() {
+    fn inject_bootstrap_params_scalars_for_single_prompt() {
         for mut body in [
             json!({"text": "hi"}),
             json!({"input_ids": [1, 2, 3]}),
             json!({}),
         ] {
-            inject_generate(&mut body, &endpoint());
+            inject_bootstrap_params(&mut body, &endpoint());
             assert_eq!(body["bootstrap_host"], "10.0.0.7");
             assert_eq!(body["bootstrap_port"], 30000);
             assert!(body["bootstrap_room"].is_i64(), "{body}");
@@ -871,12 +794,12 @@ mod tests {
     /// lists: host/port broadcast, one fresh room per item (mini_lb parity —
     /// no reliance on the scalar-room+i rule across implementations).
     #[test]
-    fn inject_generate_lists_for_batch() {
+    fn inject_bootstrap_params_lists_for_batch() {
         for (mut body, n) in [
             (json!({"text": ["a", "b", "c"]}), 3),
             (json!({"input_ids": [[1], [2]]}), 2),
         ] {
-            inject_generate(&mut body, &endpoint());
+            inject_bootstrap_params(&mut body, &endpoint());
             assert_eq!(body["bootstrap_host"], json!(vec!["10.0.0.7"; n]), "{body}");
             assert_eq!(body["bootstrap_port"], json!(vec![30000; n]));
             let rooms = body["bootstrap_room"].as_array().unwrap();
@@ -1020,6 +943,56 @@ mod tests {
         assert!(
             !pool.list()[0].healthy,
             "a refused connection marks the worker down (out of rotation)"
+        );
+    }
+
+    /// Sequential forwards to the same worker ride ONE TCP connection: the
+    /// shared hyper-util client pools keep-alive connections, and the
+    /// drain-to-EOF in `forward` is what returns them to the pool. Guards the
+    /// pooling assumption against a per-forward client or a dropped drain.
+    #[tokio::test]
+    async fn forwards_reuse_pooled_connection() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+        use std::sync::Mutex;
+
+        use axum::extract::ConnectInfo;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peers: Arc<Mutex<HashSet<SocketAddr>>> = Arc::default();
+        let seen = peers.clone();
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().insert(peer);
+                    "ok"
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let pool = pool_with(&[&format!("http://{addr}")]);
+        for _ in 0..3 {
+            pool.forward(
+                &format!("http://{addr}/generate"),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .expect("forward succeeds");
+        }
+        assert_eq!(
+            peers.lock().unwrap().len(),
+            1,
+            "three sequential forwards must reuse one pooled connection"
         );
     }
 

@@ -1,22 +1,7 @@
-//! PD KV bootstrap registry — the rust port of Python
-//! `CommonKVBootstrapServer` (disaggregation/common/conn.py), which every
-//! transfer backend (mooncake / mori / nixl / ascend) subclasses without
-//! overrides, so this one implementation covers them all.
-//!
-//! Prefill ranks PUT their `{rank_ip, rank_port}` to `/route`; decode ranks
-//! GET per-rank routes and the aggregate topology (the all `-1` sentinel
-//! query); the PD router registers/queries per-room dp ranks. The wire
-//! protocol is Python-owned — field names, status codes, and the `-1`
-//! sentinel below are parity pins, not this crate's design.
-//!
-//! Served on the api listener itself: `api_server::serve` merges
-//! [`router_and_sweeper`]'s routes on every prefill server
-//! (`ServerArgs::enable_pd_bootstrap()`). In rust-server mode the resolved
-//! `disaggregation_bootstrap_port` is aliased to the api port, so KV managers
-//! register here without knowing about the merge. The scheduler starts the
-//! rust server BEFORE `init_disaggregation` — the KV managers register
-//! synchronously there, with only a few bounded retries, so the routes must
-//! already be accepting.
+//! PD KV bootstrap registry — rust port of Python `CommonKVBootstrapServer` (shared by all
+//! transfer backends): prefill ranks PUT `/route`, decode ranks GET routes and the `-1`-sentinel
+//! topology, the PD router tracks per-room dp ranks; the wire format is Python-owned parity.
+//! Mounted on the prefill api listener (bootstrap port = api port) before `init_disaggregation`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,22 +15,22 @@ use axum::routing::{post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::utils::response::json_error;
 use crate::utils::serialize::{parse_int, parse_int_opt, parse_int_vec};
 
-/// Python default: `SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)`.
+/// Python default: `SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL`.
 const ENTRY_CLEANUP_INTERVAL_ENV: &str = "SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL";
 const ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS: u64 = 120;
+const ROOM_SHARD_COUNT: usize = 64;
 
-/// One registered prefill rank, exactly the JSON the Python decode side
-/// consumes (`PrefillRankInfo`).
+/// Python's (`PrefillRankInfo`).
 #[derive(Clone, Serialize)]
-struct RankInfo {
+struct PrefillRankInfo {
     rank_ip: String,
     rank_port: i64,
 }
 
-/// The all-`-1` sentinel response, exactly Python's
-/// `dataclasses.asdict(PrefillServerInfo)` shape.
+/// Python's (`PrefillServerInfo`).
 #[derive(Serialize)]
 struct PrefillServerInfo {
     attn_tp_size: i64,
@@ -67,24 +52,13 @@ struct RoomEntry {
 /// Mirror of the Python server's mutable state, split by write pattern.
 #[derive(Default)]
 struct Registry {
-    /// Copy-on-write: written only during startup rank registration (bounded
-    /// by the world size), then read on every `/route` lookup — reads take a
-    /// lock-free snapshot, each PUT swaps in a freshly built copy.
+    /// Copy-on-write topology.
     topology: ArcSwap<Topology>,
-    /// Per-request writes — see [`RoomShards`] for why this is sharded
-    /// mutexes rather than copy-on-write or one map-wide lock.
+    /// Per shard locking map.
     rooms: RoomShards,
 }
 
-/// Power of two so the modulo compiles to a mask. 64 keeps the worst
-/// per-shard sweep hold sub-millisecond even at ~1M live rooms (measured
-/// ~38ms for a full 1M-entry retain, /64 per shard) at no per-op cost —
-/// the uncontended lock+lookup is ~a few hundred ns regardless of count.
-const ROOM_SHARD_COUNT: usize = 64;
-
-/// Room→dp-rank entries, sharded [`ROOM_SHARD_COUNT`] ways by the room's low
-/// bits (rooms are uniform random u63s, and a router's `room + index` fan-out
-/// spreads consecutive rooms across shards too).
+/// Room→dp-rank entries, sharded `room % `[`ROOM_SHARD_COUNT`].
 struct RoomShards([Mutex<HashMap<i64, RoomEntry>>; ROOM_SHARD_COUNT]);
 
 // Manual: `Default` is only derivable for arrays up to 32 elements.
@@ -111,8 +85,7 @@ impl RoomShards {
             .map(|entry| entry.dp_rank)
     }
 
-    /// Drop entries older than `ttl`, one shard at a time — no lock is held
-    /// across shards, so a sweep never stalls the whole registry.
+    /// Drop entries older than `ttl`, one shard at a time.
     fn sweep(&self, ttl: Duration) {
         for shard in &self.0 {
             shard
@@ -123,10 +96,7 @@ impl RoomShards {
     }
 }
 
-/// The registration topology. First PUT wins for the scalars (Python's
-/// `if self.x is None` pattern); `registered_count` counts raw PUTs, and
-/// readiness is `count >= dp*cp*tp*pp` — both verbatim from Python,
-/// re-registrations included.
+/// The registration topology.
 #[derive(Clone, Default)]
 struct Topology {
     attn_tp_size: Option<i64>,
@@ -140,7 +110,7 @@ struct Topology {
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
-    prefill_ranks: HashMap<(i64, i64, i64, i64), RankInfo>,
+    prefill_ranks: HashMap<(i64, i64, i64, i64), PrefillRankInfo>,
     registered_count: i64,
 }
 
@@ -164,7 +134,7 @@ impl Topology {
 
 /// PUT /route payload (`CommonKVManager.register_to_bootstrap`).
 #[derive(Deserialize)]
-struct RoutePut {
+struct Route {
     attn_tp_size: i64,
     attn_tp_rank: i64,
     attn_cp_size: i64,
@@ -190,15 +160,7 @@ struct RoutePut {
     enable_dsa_cache_layer_split: Option<bool>,
 }
 
-fn not_ready(registered_count: i64) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        format!("Prefill server not fully registered yet ({registered_count} workers registered)."),
-    )
-        .into_response()
-}
-
-async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<RoutePut>) -> Response {
+async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
     // `system_dp_size == 1` → attention-dp topology; else system-dp topology.
     let dp_size = if body.system_dp_size == 1 {
         body.attn_dp_size
@@ -236,7 +198,7 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<RoutePut
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
-            RankInfo {
+            PrefillRankInfo {
                 rank_ip: body.rank_ip.clone(),
                 rank_port: body.rank_port,
             },
@@ -272,22 +234,26 @@ async fn route_get(
         rank("target_tp_rank"),
         rank("target_pp_rank"),
     ) else {
-        return (
+        return json_error(
             StatusCode::BAD_REQUEST,
             "Missing inputs for bootstrap server.",
-        )
-            .into_response();
+        );
     };
 
     let topo = state.topology.load();
     // Python checks readiness in both branches; hoisted, same behavior.
     if !topo.is_ready() {
-        return not_ready(topo.registered_count);
+        let registered_count = topo.registered_count;
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "Prefill server not fully registered yet ({registered_count} workers registered)."
+            ),
+        );
     }
 
     if (dp, cp, tp, pp) == (-1, -1, -1, -1) {
-        // Aggregate-topology sentinel. The sizes are Some — `is_ready` above
-        // requires all four.
+        // Aggregate-topology sentinel.
         return Json(PrefillServerInfo {
             attn_tp_size: topo.attn_tp_size.unwrap(),
             attn_cp_size: topo.attn_cp_size.unwrap(),
