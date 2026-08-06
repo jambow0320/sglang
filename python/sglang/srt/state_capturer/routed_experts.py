@@ -41,7 +41,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     ) -> Optional["RoutedExpertsCapturer"]:
         if not get_exec().features.enable_return_routed_experts:
             return None
-        if not get_exec().moe.disable_shared_experts_fusion and hasattr(
+        from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+
+        if not is_shared_experts_fusion_disabled() and hasattr(
             model, "num_fused_shared_experts"
         ):
             num_fused_shared_experts = model.num_fused_shared_experts

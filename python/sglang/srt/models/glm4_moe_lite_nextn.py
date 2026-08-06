@@ -25,6 +25,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -35,7 +36,7 @@ from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -155,9 +156,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
-        self.num_fused_shared_experts = (
-            0 if get_exec().moe.disable_shared_experts_fusion else 1
-        )
+        self.num_fused_shared_experts = 0 if is_shared_experts_fusion_disabled() else 1
 
     @torch.no_grad()
     def forward(
