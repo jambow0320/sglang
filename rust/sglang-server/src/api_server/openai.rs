@@ -4,11 +4,7 @@
 //! request and response primitives. Native [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
-use axum::{
-    Json, Router,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -117,11 +113,7 @@ pub(super) fn openai_error_response(
     message: impl Into<String>,
     stream: bool,
 ) -> Response {
-    let body = error_payload(code, message.into());
-    if !stream {
-        return (code, Json(body)).into_response();
-    }
-    super::submit::sse_error_response(body)
+    crate::utils::response::error_response(code, error_payload(code, message.into()), stream)
 }
 
 /// Unary OpenAI error — the common pre-submit case (Python validates before

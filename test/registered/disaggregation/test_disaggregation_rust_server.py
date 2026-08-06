@@ -1,14 +1,16 @@
 """PD disaggregation with the embedded Rust server on both sides.
 
-Same 2-GPU layout as test_disaggregation_basic (prefill GPU 0, decode GPU 1,
-mini_lb in front), but prefill and decode run with ``SGLANG_RUST_SERVER=1`` —
-covering the Rust `/generate` bootstrap-field intake (scalar form via the gsm8k
-eval's single-prompt requests, per-item list form via the batch test), the
-positional scheduler-wire PD block, the KV bootstrap registry served on the
-rust api listener, the PD warmup fan-out, and the fake-bootstrap health probe.
-
-The Rust server has no OpenAI endpoints, so everything (including the gsm8k
-eval) goes through ``/generate``.
+Same 2-GPU layout as test_disaggregation_basic (prefill GPU 0, decode GPU 1),
+but prefill and decode run with ``SGLANG_RUST_SERVER=1`` and there is NO
+separate load-balancer process: the decode server embeds the PD load balancer
+and is the front door (`lb_url` aliases it); the fixture registers the prefill
+url at runtime via ``POST /prefill_workers`` — the only way to populate it. Covered: the embedded LB's bootstrap injection (scalar form via the gsm8k
+eval's single-prompt requests, per-item list form via the batch test) and
+prefill forwarding, the runtime prefill-url registration API
+(`/prefill_workers`), the Rust `/generate` and `/v1/chat/completions`
+bootstrap-field intake, the positional scheduler-wire PD block, the KV
+bootstrap registry served on the rust api listener, the PD warmup fan-out, and
+the fake-bootstrap health probe.
 
 Usage:
 python3 -m unittest test_disaggregation_rust_server.TestDisaggregationRustServer
@@ -37,6 +39,8 @@ register_cuda_ci(est_time=500, stage="base-b", runner_config="2-gpu-large")
 class TestDisaggregationRustServer(PDDisaggregationServerBase):
     extra_prefill_env = {"SGLANG_RUST_SERVER": "1"}
     extra_decode_env = {"SGLANG_RUST_SERVER": "1"}
+    # The decode server is the PD front door — no mini_lb process.
+    embedded_lb = True
 
     @classmethod
     def setUpClass(cls):
@@ -44,8 +48,8 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         # Rust-server prefill serves the KV bootstrap registry on its api
         # listener (a separate --disaggregation-bootstrap-port is a launch
         # error there), so point both sides' bootstrap port at it: decode's
-        # flag is its fallback for requests without a bootstrap_port field,
-        # which is what mini_lb sends when --prefill carries no port.
+        # flag is its fallback for requests without a bootstrap_port field.
+        # (The embedded LB itself injects the prefill URL's port explicitly.)
         cls.bootstrap_port = cls.prefill_port
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         # launch_all already exercises the PD-specific plumbing: the rust PD
@@ -56,7 +60,7 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=self.lb_url,
             eval_name="gsm8k",
-            api="generate",  # the Rust server has no /v1/completions
+            api="generate",
             max_tokens=512,
             num_examples=64,
             num_threads=32,
@@ -67,8 +71,8 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
 
     def test_generate_stream_via_lb(self):
         # The scalar-bootstrap non-stream path is already covered 64x with an
-        # accuracy gate by test_gsm8k; what is unique here is mini_lb passing
-        # the decode node's SSE frames through under PD.
+        # accuracy gate by test_gsm8k; what is unique here is the decode front
+        # door serving its own SSE frames under PD while forwarding to prefill.
         response = requests.post(
             self.lb_url + "/generate",
             json={
@@ -106,8 +110,8 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         self.assertEqual(len({chunk["meta_info"]["id"] for chunk in chunks}), 1)
 
     def test_batch_generate_via_lb(self):
-        # A batch makes the router inject per-item bootstrap lists — the list
-        # intake + per-item fan-out path on the Rust side.
+        # A batch makes the embedded LB inject per-item bootstrap lists — the
+        # list injection + intake + per-item fan-out path on the Rust side.
         response = requests.post(
             self.lb_url + "/generate",
             json={
@@ -125,11 +129,11 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
             self.assertIn(expected, item["text"].lower(), item)
             self.assertIsNotNone(item["meta_info"]["finish_reason"])
 
-    def test_logprob_merge_via_lb(self):
-        # With return_logprob the router merges the *prefill* response's
-        # input_token_logprobs into the decode response — both sides must
-        # produce complete logprob meta_info. (No `return_input_logprob` here:
-        # the Rust /generate body does not declare it.)
+    def test_logprob_via_lb(self):
+        # The embedded LB deliberately does NOT merge the prefill response's
+        # input_token_logprobs into the decode response (mini_lb did; scope
+        # decision of the embedded front door) — so only decode-side logprob
+        # completeness is asserted here.
         response = requests.post(
             self.lb_url + "/generate",
             json={
@@ -142,15 +146,64 @@ class TestDisaggregationRustServer(PDDisaggregationServerBase):
         self.assertEqual(response.status_code, 200)
         meta = response.json()["meta_info"]
         self.assertEqual(len(meta["output_token_logprobs"]), meta["completion_tokens"])
-        # The *whole* prompt, since logprob_start_len is 0: a merge that drops
-        # prefill's list and leaves only what decode itself saw still yields a
-        # non-empty list, so pin the exact length.
-        self.assertEqual(len(meta["input_token_logprobs"]), meta["prompt_tokens"])
+
+    def test_chat_completions_via_lb(self):
+        # OpenAI intake through the front door: the decode server renders +
+        # generates locally with injected scalar bootstrap params and forwards
+        # the same JSON to the prefill server's /v1/chat/completions (whose
+        # raw-body bootstrap intake pairs the same room). mini_lb never
+        # exercised this against rust PD nodes.
+        response = requests.post(
+            self.lb_url + "/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "user", "content": "What is the capital of France?"}
+                ],
+                "temperature": 0,
+                "max_tokens": 32,
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        content = body["choices"][0]["message"]["content"]
+        self.assertIn("paris", content.lower(), body)
+
+    def test_prefill_worker_registration_api(self):
+        # The prefill list is managed entirely via the front door's admin API
+        # (the fixture registered prefill_url during launch). Register a second
+        # (never-picked-after-cleanup) endpoint, see it listed, deregister it,
+        # and confirm the original entry is intact -- guards the curl workflow
+        # of adding prefill workers to a running decode server.
+        admin_url = self.lb_url + "/prefill_workers"
+        current = requests.get(admin_url, timeout=10).json()["prefill_workers"]
+        self.assertEqual([w["url"] for w in current], [self.prefill_url])
+        extra = f"http://{self.base_host}:9"
+        response = requests.post(admin_url, json={"url": extra}, timeout=10)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["added"], 1)
+        urls = {
+            w["url"]
+            for w in requests.get(admin_url, timeout=10).json()["prefill_workers"]
+        }
+        self.assertEqual(urls, {self.prefill_url, extra})
+        response = requests.delete(admin_url, json={"url": extra}, timeout=10)
+        self.assertEqual(response.status_code, 200, response.text)
+        urls = [
+            w["url"]
+            for w in requests.get(admin_url, timeout=10).json()["prefill_workers"]
+        ]
+        self.assertEqual(urls, [self.prefill_url])
+        # A malformed entry is rejected outright (atomic, nothing applied).
+        response = requests.post(admin_url, json={"url": "https://nope:1"}, timeout=10)
+        self.assertEqual(response.status_code, 400, response.text)
 
     def test_missing_bootstrap_is_rejected(self):
         # Negative branch of the fake-bootstrap health probe: a /generate that
-        # reaches a PD node *without* the router's bootstrap fields must surface
-        # the scheduler's 400 abort through the rust wire — not hang, not 500.
+        # reaches the PREFILL node *without* bootstrap fields must surface the
+        # scheduler's 400 abort through the rust wire — not hang, not 500.
+        # (The decode node would instead route it: it embeds the LB.)
         # Nothing else in this suite reaches the rust egress' abort_status path.
         response = requests.post(
             self.prefill_url + "/generate",

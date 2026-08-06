@@ -1,0 +1,116 @@
+# Sample requests for the embedded PD load balancer's admin API
+# (rust/sglang-server/src/api_server/disaggregation/load_balancer.rs).
+#
+# Mounted ONLY on a decode-mode rust server:
+#   SGLANG_RUST_SERVER=1 python -m sglang.launch_server \
+#       --model-path <model> --disaggregation-mode decode --port 30200 ...
+# Any other role answers 404 for these paths.
+#
+# Entry grammar: plain `http://host:port` — explicit port, no path/query, no
+# https (the forward client has no TLS connector). The port doubles as the
+# bootstrap port: a rust-server prefill serves the KV bootstrap registry on
+# its api port. Registrations are in-memory; they do not survive a restart.
+#
+# Run with the VS Code "REST Client" extension, or copy the curl equivalents
+# from the comments.
+
+@decode = http://127.0.0.1:30200
+
+### List registered prefill workers (with live health marks)
+# curl http://127.0.0.1:30200/prefill_workers
+GET {{decode}}/prefill_workers
+
+# 200:
+# {
+#   "prefill_workers": [
+#     {"url": "http://10.0.0.1:30100", "bootstrap_host": "10.0.0.1",
+#      "bootstrap_port": 30100, "healthy": true}
+#   ]
+# }
+# "healthy": false = worker is down (transport-level forward failure) and out
+# of rotation until it passes /health, a forward succeeds, or it re-registers.
+
+### Register one prefill worker
+# curl -X POST http://127.0.0.1:30200/prefill_workers \
+#      -H 'Content-Type: application/json' \
+#      -d '{"url": "http://10.0.0.1:30100"}'
+POST {{decode}}/prefill_workers
+Content-Type: application/json
+
+{"url": "http://10.0.0.1:30100"}
+
+# 200: {"added": 1, "updated": 0, "prefill_workers": [...]}
+# Re-POSTing the same URL is idempotent ("updated": 1) and revives the worker
+# if it was marked down (an operator's assertion that it is back).
+
+### Register a batch (atomic: one bad entry 400s the whole request)
+# curl -X POST http://127.0.0.1:30200/prefill_workers \
+#      -H 'Content-Type: application/json' \
+#      -d '{"urls": ["http://10.0.0.2:30100", "http://[2001:db8::1]:30100"]}'
+POST {{decode}}/prefill_workers
+Content-Type: application/json
+
+{"urls": ["http://10.0.0.2:30100", "http://[2001:db8::1]:30100"]}
+
+# 200: {"added": 2, "updated": 0, "prefill_workers": [...]}
+# IPv6 hosts keep their brackets in bootstrap_host.
+
+### Deregister a worker
+# curl -X DELETE http://127.0.0.1:30200/prefill_workers \
+#      -H 'Content-Type: application/json' \
+#      -d '{"url": "http://10.0.0.2:30100"}'
+DELETE {{decode}}/prefill_workers
+Content-Type: application/json
+
+{"url": "http://10.0.0.2:30100"}
+
+# 200: {"prefill_workers": [...]}   (the remaining set)
+# 404: {"error": {"message": "prefill url ... is not registered", "code": 404}}
+# The URL is normalized before matching (e.g. a trailing slash is fine).
+
+### Error: https is rejected (no TLS connector)
+POST {{decode}}/prefill_workers
+Content-Type: application/json
+
+{"url": "https://10.0.0.9:30100"}
+
+# 400, message: "prefill url 'https://10.0.0.9:30100' must be plain http://
+#                (the embedded PD load balancer has no TLS support)"
+
+### Error: explicit port required
+POST {{decode}}/prefill_workers
+Content-Type: application/json
+
+{"url": "http://10.0.0.9"}
+
+# 400, message: "... must include an explicit port"
+
+### Error: no path or query allowed
+POST {{decode}}/prefill_workers
+Content-Type: application/json
+
+{"url": "http://10.0.0.9:30100/v1"}
+
+# 400, message: "... must not carry a path or query"
+
+### Error: empty body (neither 'url' nor 'urls')
+POST {{decode}}/prefill_workers
+Content-Type: application/json
+
+{}
+
+# 400, message: "provide 'url' or 'urls' (entry format: http://host:port)"
+
+### End-to-end check: once a worker is registered, the decode server is the
+### PD front door — send generation straight to it, no external router needed.
+# curl -X POST http://127.0.0.1:30200/generate \
+#      -H 'Content-Type: application/json' \
+#      -d '{"text": "The capital of France is",
+#           "sampling_params": {"temperature": 0, "max_new_tokens": 16}}'
+POST {{decode}}/generate
+Content-Type: application/json
+
+{
+  "text": "The capital of France is",
+  "sampling_params": {"temperature": 0, "max_new_tokens": 16}
+}

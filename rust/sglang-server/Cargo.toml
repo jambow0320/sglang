@@ -32,6 +32,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 uuid = { workspace = true }
 
+arc-swap = "1"
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 core_affinity = "0.8"
 # the dynamo-tokenizers is deps on hf-hub, should bump version together.
@@ -43,8 +44,14 @@ dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 flume = "0.12.0"
+# Outbound HTTP for the embedded PD load balancer (decode → prefill forward).
+# Already compiled transitively (axum/dynamo); promoted to direct deps so the
+# legacy pooled client is nameable. Plain HTTP only — no TLS connector.
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 itertools = "0.14"
 hf-hub = { version = "0.4", default-features = false }
+rand = "0.9"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # Pinned EXACTLY: this crate's accepted grammar defines the

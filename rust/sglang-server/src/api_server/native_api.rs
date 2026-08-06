@@ -20,18 +20,19 @@ use axum::{
     },
     routing::{get, post},
 };
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use super::AppState;
 use super::frame::{
-    OutputAccumulator, cumulative_frame_string, error_value, frame_value, stream_frame_string,
-    tag_value,
+    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string, tag_value,
 };
 use super::guard::AbortGuard;
 use super::submit::{pre_submit_error, submit};
 use crate::environ::env_bool;
 use crate::ids::Rid;
 use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
+use crate::utils::response::error_value;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -135,20 +136,39 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
 /// dispatches to the single or batch path; a malformed body is a 400 before
 /// anything reaches the scheduler.
 ///
-/// The body is extracted as a `Result` so a deserialization failure is answered
-/// with **400** (Python's status for a bad request) carrying serde's field-level
-/// message, instead of axum's default 422.
+/// The body is extracted as raw JSON so the embedded PD front door (see
+/// `pd_lb`) can inject bootstrap params before the typed parse; extraction is
+/// still a `Result` so a malformed body is answered with **400** (Python's
+/// status for a bad request), instead of axum's default 422.
 async fn generate(
     State(state): State<AppState>,
-    body: Result<Json<GenerateBody>, JsonRejection>,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
-    let body = match body {
-        Ok(Json(body)) => body,
+    let mut value = match body {
+        Ok(Json(value)) => value,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
         // handler runs).
         Err(rejection) => {
             return pre_submit_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    // PD front door: an unrouted request gets bootstrap params injected here
+    // (mini_lb shape), then `into_requests` fans them out like any
+    // router-supplied ones — the local decode path needs no other special case.
+    // An empty pool (nothing registered yet) picks nothing and the request
+    // falls through untouched, exactly like a decode node without the LB.
+    let forward = match &state.prefill_worker_pool {
+        Some(pool) if !super::pd_lb::has_bootstrap(&value) => pool.pick().map(|endpoint| {
+            super::pd_lb::inject_generate(&mut value, &endpoint);
+            (pool.clone(), endpoint)
+        }),
+        _ => None,
+    };
+    let body = match GenerateBody::deserialize(&value) {
+        Ok(body) => body,
+        Err(e) => {
+            return pre_submit_error(StatusCode::BAD_REQUEST, &e.to_string(), false);
         }
     };
     let stream = body.stream;
@@ -162,6 +182,19 @@ async fn generate(
             return pre_submit_error(code, &e.to_string(), stream);
         }
     };
+    // Forward only after the body parsed and fanned out: a 400-able request
+    // never reaches the prefill server (mini_lb dispatches both legs together).
+    if let Some((pool, endpoint)) = forward {
+        let rids = payloads.iter().map(|p| p.rid.clone()).collect();
+        super::pd_lb::spawn_forward(
+            pool,
+            endpoint,
+            "/generate",
+            &value,
+            rids,
+            state.senders.clone(),
+        );
+    }
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
         let payload = payloads

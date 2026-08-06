@@ -2,24 +2,15 @@
 //! module: mint the client-visible rid (uuid hex, Python-parity), build the
 //! `Request`, and hand it to the TM with an egress receiver for the response.
 
-use std::convert::Infallible;
-
-use axum::{
-    Json,
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-};
+use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
 use super::AppState;
-use super::frame::error_value;
 use crate::fsm::RequestState;
 use crate::ids::Rid;
 use crate::message::{EgressItem, EgressSink, Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
+use crate::utils::response::{error_response, error_value};
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
 /// receiver. Every request arrives with its final rid — a generate request from
@@ -77,23 +68,7 @@ pub(super) async fn submit(
 /// one SSE error frame and `[DONE]`, not a 4xx: the client has already committed
 /// to reading a stream, and Python answers it inside `stream_results()`.
 pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
-    let body = error_value(code.as_u16(), message);
-    if !stream {
-        return (code, Json(body)).into_response();
-    }
-    sse_error_response(body)
-}
-
-/// A 200 SSE response carrying one error frame + `[DONE]` — how a stream the
-/// client is already committed to reading reports a failure. Shared by every
-/// endpoint family: the native API via [`pre_submit_error`] and the OpenAI
-/// frontend's `openai_error_response`.
-pub(super) fn sse_error_response(body: serde_json::Value) -> Response {
-    let frames = [body.to_string(), "[DONE]".to_string()];
-    Sse::new(futures::stream::iter(
-        frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
-    ))
-    .into_response()
+    error_response(code, error_value(code.as_u16(), message), stream)
 }
 
 #[cfg(test)]

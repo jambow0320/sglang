@@ -47,6 +47,12 @@ def assert_process_healthy(test_case, name, process, url, health_path="/health")
 
 
 class PDDisaggregationServerBase(CustomTestCase):
+    # Rust-server (SGLANG_RUST_SERVER) decode nodes embed the PD load
+    # balancer: the decode server is the PD front door (prefill urls are
+    # registered at runtime via its /prefill_workers API), no separate
+    # mini_lb process runs, and `lb_url` aliases the decode server so tests
+    # are written once against the front door.
+    embedded_lb: ClassVar[bool] = False
     capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
@@ -162,19 +168,34 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def launch_all(cls):
-        """Start prefill, decode, wait for health, and launch LB."""
+        """Start prefill, decode, wait for health, and launch the LB (or point
+        `lb_url` at the decode front door when the LB is embedded)."""
         cls.start_prefill()
         cls.start_decode()
         cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
         cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
-        cls.launch_lb()
-        cls._fail_fast_stop = start_subprocess_fail_fast_watcher(
-            [
-                ("prefill", cls.process_prefill),
-                ("decode", cls.process_decode),
-                ("lb", cls.process_lb),
-            ]
+        watched = [
+            ("prefill", cls.process_prefill),
+            ("decode", cls.process_decode),
+        ]
+        if cls.embedded_lb:
+            cls.lb_url = cls.base_url = cls.decode_url
+            cls.register_prefill_with_decode()
+        else:
+            cls.launch_lb()
+            watched.append(("lb", cls.process_lb))
+        cls._fail_fast_stop = start_subprocess_fail_fast_watcher(watched)
+
+    @classmethod
+    def register_prefill_with_decode(cls):
+        """Populate the embedded LB: prefill urls are registered exclusively at
+        runtime through the decode front door's admin API (no CLI seed)."""
+        response = requests.post(
+            cls.decode_url + "/prefill_workers",
+            json={"url": cls.prefill_url},
+            timeout=10,
         )
+        response.raise_for_status()
 
     @classmethod
     def launch_lb(cls):
