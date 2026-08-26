@@ -396,6 +396,11 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    # The decode control socket multiplexes tagged messages, so the status
+    # message is tagged too. It is new to NIXL, hence free to carry the reason.
+    kv_status_msg_tag = b"KV_STATUS"
+    kv_status_msg_carries_reason = True
+
     def __init__(
         self,
         args: KVArgs,
@@ -516,9 +521,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if self.enable_staging:
                 self._init_staging_decode_ctx()
-                self._staging_handler = None
-            if self.enable_staging or self.enable_deferred_decode_kv_release:
-                self._start_decode_listener_thread()
+            self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -590,15 +593,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_receivers[room] = receiver
 
     def _start_decode_listener_thread(self):
-        """Decode-side ZMQ listener for STAGING_REQ and ABORT_ACK. A thread, not
-        NIXL notifs: the decode agent has no progress thread, so notifs only drain
-        inside a live receiver's poll() and would be missed while idle."""
+        """Decode-side ZMQ listener for KV_STATUS, STAGING_REQ and ABORT_ACK. A
+        thread, not NIXL notifs: the decode agent has no progress thread, so notifs
+        only drain inside a live receiver's poll() and would be missed while idle.
+
+        Started unconditionally: KV_STATUS carries prefill-side transfer failures,
+        which are independent of staging and deferred KV release."""
 
         def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
+                    if self.enable_staging:
+                        self._handle_staging_req(msg)
                     continue
                 if msg[0] == b"ABORT_ACK":
                     # Drain ack for an aborted room; aggregate per prefill rank.
@@ -606,6 +613,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self.note_abort_ack(
                             int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
                         )
+                    continue
+                parsed = self.parse_kv_status_message(msg)
+                if parsed is not None:
+                    self.apply_prefill_status(*parsed)
                     continue
                 logger.warning(
                     "decode_listener_thread: unexpected message tag %s",
@@ -654,14 +665,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         self._staging_ctx.prefetched_rooms.add(room)
 
+    @staticmethod
+    def _transfer_info_is_dummy(info: TransferInfo) -> bool:
+        return info.is_dummy()
+
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        # Keep Failed sticky until the sender clears the room.
-        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
-            return
-        super().update_status(bootstrap_room, status)
 
     def _prep_equal_tp_dlist(
         self,
@@ -1307,17 +1316,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                # Raise only once every handle of this batch settled, not on the
+                # first ERR: a sibling still in PROC keeps writing into the
+                # decode's KV pages, and the failure path below tells the decode
+                # those pages are free.
                 while handles:
-                    all_done = True
+                    all_settled = True
+                    any_failed = False
                     for handle in handles:
                         state = self.agent.check_xfer_state(handle)
                         if state == "ERR":
+                            any_failed = True
+                        elif state != "DONE":
+                            all_settled = False
+                    if all_settled:
+                        if any_failed:
                             raise RuntimeError(
                                 f"NIXL transfer encountered ERR room={room}"
                             )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
                         break
                     time.sleep(0)
 
@@ -1363,10 +1379,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
-                # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                self.conclude_failure(room, str(e))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2846,6 +2859,13 @@ class NixlKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
+    def clear(self) -> None:
+        super().clear()
+        # transfer_statuses is NIXL's own per-room bookkeeping -- the other
+        # backends track completion through prefill_response_tracker, which
+        # CommonKVReceiver.clear() already drops -- so it needs its own pop.
+        self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -2940,11 +2960,7 @@ class NixlKVReceiver(CommonKVReceiver):
         # deadline would otherwise lose to the timeout purely by poll ordering.
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-                self.bootstrap_room
-            )
             self.conclude_state = KVPoll.Success
-            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
 
         timeout_result = self._check_waiting_timeout()
