@@ -584,6 +584,26 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
+    def drain_decode_control_messages(self) -> None:
+        if self.enable_staging:
+            # The notification is delivered with the staged write, while its
+            # CHUNK_READY waits on ZMQ I/O-thread wake-ups on both nodes.
+            for notifs in self.agent.get_new_notifs().values():
+                for notif in notifs:
+                    components = notif.decode("ascii").split("_")
+                    if len(components) == 6 and components[1] == "stg":
+                        self._handle_stg_notification(components, int(components[0]))
+        super().drain_decode_control_messages()
+
+    def _handle_stg_notification(self, components: List[str], room: int) -> None:
+        """``{room}_stg_{chunk_idx}_{page_start}_{num_pages}_{writer_rank}``."""
+        if room not in self.request_status or self._staging_handler is None:
+            return
+        chunk_idx, page_start, num_pages, writer_rank = map(int, components[2:])
+        self._staging_handler.handle_chunk_arrived(
+            room, chunk_idx, page_start, num_pages, writer_rank
+        )
+
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -2037,6 +2057,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         staging_buffer=None,
+        notif: str = "",
     ):
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -2124,7 +2145,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
 
         xfer_handle = self.agent.initialize_xfer(
-            "WRITE", src_descs, dst_descs, peer_name
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
         )
         if not xfer_handle:
             raise RuntimeError(
@@ -2214,6 +2235,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_info.decode_tp_size,
             dst_info.dst_kv_item_len,
             staging_buffer=staging_strategy.staging_buffer,
+            notif=(
+                f"{kv_chunk.room}_stg_{chunk_idx}_{page_start}_{num_pages}_"
+                f"{self._prefill_unique_rank()}"
+            ),
         )
         if handle is None:
             # A silent slice fallback would leak this chunk's decode-side

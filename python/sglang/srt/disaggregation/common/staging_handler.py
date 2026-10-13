@@ -99,8 +99,8 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
-        # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
-        # arrivals; handler-owned so room teardown can purge them.
+        # room -> chunk_idx -> prefill ranks that reported the chunk, or None once
+        # it is scattered; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
@@ -289,12 +289,12 @@ class DecodeStagingHandler:
         chunk_idx: int,
         page_start: int,
         num_pages: int,
-        writer_id: str,
+        writer_rank: int,
     ) -> bool:
-        """Process a staging chunk arrival reported by a ZMQ CHUNK_READY message.
+        """Process a staging chunk arrival reported by its prefill writer rank.
 
-        Accumulates writer arrivals and submits scatter once all writers for
-        this chunk have reported in. Returns True if scatter was submitted.
+        A writer may report a chunk twice (backend notification and CHUNK_READY).
+        Submits the scatter once every writer has reported; returns True then.
         """
         # Read from the stash, not decode_req.kv_receiver: a concurrent teardown
         # nulls the latter before unregister removes the room.
@@ -307,14 +307,16 @@ class DecodeStagingHandler:
             )
             return False
         room_counts = self._writer_counts.setdefault(room, {})
-        arrivals = room_counts.setdefault(chunk_idx, [])
-        arrivals.append((page_start, num_pages, writer_id))
-        num_writers = self.num_writers_for(receiver)
-        if len(arrivals) >= num_writers:
-            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
-            del room_counts[chunk_idx]
-            return True
-        return False
+        writers = room_counts.setdefault(chunk_idx, set())
+        if writers is None:
+            # Already scattered; its staging slot may be reused by now.
+            return False
+        writers.add(writer_rank)
+        if len(writers) < self.num_writers_for(receiver):
+            return False
+        room_counts[chunk_idx] = None
+        self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+        return True
 
     def submit_last_scatter_async(self, room: int) -> bool:
         """Record all-ranks Success. Scatter is fully arrival-driven (every

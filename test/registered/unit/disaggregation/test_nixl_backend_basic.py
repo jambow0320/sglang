@@ -14,7 +14,10 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import AbortAck, CommonKVManager
-from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
+    PrefillStagingContext,
+)
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
@@ -1050,9 +1053,24 @@ class TestNixlDecodeControlDrain(CustomTestCase):
 
         self.assertEqual(receiver.poll(), KVPoll.Success)
         mgr._staging_handler.handle_chunk_arrived.assert_called_once_with(
-            11, 0, 0, 2, "decode_agent"
+            11, 0, 0, 2, 0
         )
         self.assertEqual(mgr.server_socket.messages, [])
+
+    def test_staged_write_notification_reports_the_chunk_from_the_drain(self):
+        mgr = self._make_manager([])
+        mgr.enable_staging = True
+        mgr.update_status(11, KVPoll.WaitingForInput)
+        mgr.agent = MagicMock()
+        mgr.agent.get_new_notifs.return_value = {
+            "prefill": [b"11_stg_2_8_4_3", b"99_stg_0_0_1_0", b"11_aux"]
+        }
+
+        mgr.drain_decode_control_messages()
+
+        mgr._staging_handler.handle_chunk_arrived.assert_called_once_with(
+            11, 2, 8, 4, 3
+        )
 
     def test_abort_release_check_applies_queued_ack(self):
         mgr = self._make_manager([])
@@ -1122,6 +1140,38 @@ class TestNixlDecodeControlDrain(CustomTestCase):
 
         mgr.server_socket.poll.assert_not_called()
         mgr.server_socket.recv_multipart.assert_not_called()
+
+
+class TestStagingChunkArrival(CustomTestCase):
+    def _make_handler(self, num_writers):
+        handler = object.__new__(DecodeStagingHandler)
+        handler._room_to_receiver = {11: object()}
+        handler._writer_counts = {}
+        handler.num_writers_for = lambda receiver: num_writers
+        handler.submit_chunk_scatter = MagicMock(return_value=True)
+        return handler
+
+    def test_each_writer_counts_once_and_a_chunk_scatters_once(self):
+        handler = self._make_handler(num_writers=2)
+
+        # Writer 0 reports through both signals before writer 1 reports at all.
+        self.assertFalse(handler.handle_chunk_arrived(11, 0, 0, 4, 0))
+        self.assertFalse(handler.handle_chunk_arrived(11, 0, 0, 4, 0))
+        handler.submit_chunk_scatter.assert_not_called()
+        self.assertTrue(handler.handle_chunk_arrived(11, 0, 0, 4, 1))
+        # Late duplicates of a scattered chunk must not scatter its slot again.
+        self.assertFalse(handler.handle_chunk_arrived(11, 0, 0, 4, 1))
+        self.assertFalse(handler.handle_chunk_arrived(11, 0, 0, 4, 0))
+
+        handler.submit_chunk_scatter.assert_called_once_with(11, 0, 0, 4)
+
+    def test_single_writer_duplicate_does_not_rescatter(self):
+        handler = self._make_handler(num_writers=1)
+
+        self.assertTrue(handler.handle_chunk_arrived(11, 3, 8, 4, 0))
+        self.assertFalse(handler.handle_chunk_arrived(11, 3, 8, 4, 0))
+
+        handler.submit_chunk_scatter.assert_called_once_with(11, 3, 8, 4)
 
 
 class TestNixlNodeFailure(CustomTestCase):
@@ -1382,7 +1432,11 @@ class TestNixlStaging(CustomTestCase):
             staging_base_ptr=0x8000,
             staging_total_size=4096,
         )
-        mgr.send_kvcache_staged = lambda *args, **kwargs: "handle"
+        sent = {}
+        mgr.send_kvcache_staged = lambda *args, **kwargs: (
+            sent.update(kwargs) or "handle"
+        )
+        mgr._prefill_unique_rank = lambda: 5
 
         handle, deferred, chunk_idx = mgr._do_staging_transfer(
             strategy,
@@ -1396,6 +1450,8 @@ class TestNixlStaging(CustomTestCase):
         self.assertEqual(handle, "handle")
         self.assertFalse(deferred)
         self.assertEqual(chunk_idx, 2)
+        # Wire format the decode drain parses.
+        self.assertEqual(sent["notif"], "3_stg_2_4_2_5")
 
     def test_send_kvcache_staged_uses_one_bulk_vram_write(self):
         mock_gather = MagicMock()
