@@ -905,10 +905,43 @@ class TestNixlTransferWorker(CustomTestCase):
         self._run_staging_worker(mgr, [first, last])
         self.assertEqual(attempts, [0, 1, 0])
         self.assertEqual(
-            events, [("chunk", 1), ("status", KVPoll.Success), ("chunk", 0)]
+            events, [("status", KVPoll.Success), ("chunk", 1), ("chunk", 0)]
         )
         self.assertNotIn(room, mgr.transfer_infos)
         self.assertNotIn(room, mgr._staging_outstanding)
+
+    def test_last_chunk_aux_overlaps_staged_write_and_chunk_ready_follows_status(
+        self,
+    ):
+        room = 28
+        mgr = self._make_staging_manager(room)
+        events = []
+        mgr._do_staging_transfer = lambda *args: ("kv-0", False, 0)
+        mgr.send_aux.side_effect = lambda peer, *args: (
+            events.append("aux") or f"aux-{peer}"
+        )
+        await_handles = mgr._await_handles
+
+        def recording_await(handles, **kwargs):
+            events.append(("await", tuple(handles)))
+            return await_handles(handles, **kwargs)
+
+        mgr._await_handles = recording_await
+        mgr.send_chunk_ready.side_effect = lambda **kw: events.append("chunk")
+        mgr.send_kv_status_message.side_effect = lambda **kw: events.append("status")
+
+        self._run_staging_worker(mgr, [self._make_chunk(room, [1], True)])
+
+        self.assertEqual(
+            events,
+            [
+                "aux",
+                ("await", ("kv-0",)),
+                ("await", ("kv-0", "aux-agent")),
+                "status",
+                "chunk",
+            ],
+        )
 
 
 class TestNixlReceiverPoll(CustomTestCase):

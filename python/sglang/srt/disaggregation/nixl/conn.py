@@ -1240,6 +1240,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # per-req loop and `continue` the worker main loop without
                 # touching room status -- the next pop will retry.
                 staging_deferred = False
+                # The last chunk's CHUNK_READY goes out after the room concludes.
+                last_chunk_ready = []
 
                 for req in reqs_to_be_processed:
                     assert room == req.room
@@ -1249,6 +1251,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
+                    staged_handle = None
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -1391,26 +1394,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
                             if use_staging:
-                                # The next peer may gather into the same source
-                                # staging buffer. Wait before reusing it and
-                                # before allowing decode to scatter this write.
-                                settled, failed = self._await_handles(
-                                    [kv_xfer_handle], failure_seen=False
-                                )
-                                if not settled:
-                                    settle_timed_out = True
-                                if not settled or failed:
-                                    raise RuntimeError(
-                                        f"NIXL staging transfer failed room={room}"
-                                    )
-                                self.send_chunk_ready(
-                                    room=room,
-                                    chunk_idx=staging_chunk_idx,
-                                    page_start=kv_chunk.index_slice.start,
-                                    num_pages=len(kv_chunk.prefill_kv_indices),
-                                    writer_id=req.agent_name,
-                                    targets=[(req.endpoint, req.dst_port)],
-                                )
+                                staged_handle = kv_xfer_handle
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1441,6 +1425,32 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         handles.append(aux_xfer_handle)
 
+                    if staged_handle is not None:
+                        # The next peer may gather into the same source staging
+                        # buffer, and decode may only scatter a landed write. The
+                        # aux/state writes above are posted first so they overlap it.
+                        settled, failed = self._await_handles(
+                            [staged_handle], failure_seen=False
+                        )
+                        if not settled:
+                            settle_timed_out = True
+                        if not settled or failed:
+                            raise RuntimeError(
+                                f"NIXL staging transfer failed room={room}"
+                            )
+                        chunk_ready = dict(
+                            room=room,
+                            chunk_idx=staging_chunk_idx,
+                            page_start=kv_chunk.index_slice.start,
+                            num_pages=len(kv_chunk.prefill_kv_indices),
+                            writer_id=req.agent_name,
+                            targets=[(req.endpoint, req.dst_port)],
+                        )
+                        if kv_chunk.is_last_chunk:
+                            last_chunk_ready.append(chunk_ready)
+                        else:
+                            self.send_chunk_ready(**chunk_ready)
+
                 # Raise only once every handle of this batch settled, not on the
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
@@ -1468,7 +1478,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # was aborted and nothing else is outstanding.
                     self._maybe_ack_drained_abort(room)
                 if kv_chunk.is_last_chunk:
-                    self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
+                    status = self.conclude_transfer(
+                        bootstrap_room=room, status=KVPoll.Success
+                    )
+                    # Decode keeps a room open until every allocation is
+                    # scattered, so CHUNK_READY may follow KV_STATUS.
+                    if status == KVPoll.Success:
+                        for chunk_ready in last_chunk_ready:
+                            self.send_chunk_ready(**chunk_ready)
 
                 # Drop per-room state only when no chunk is still outstanding and
                 # the room has concluded: Success, or a Failed *last* chunk. A

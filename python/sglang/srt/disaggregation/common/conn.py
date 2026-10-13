@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -70,6 +71,10 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
+
+# The decode control thread takes the GIL from the busy scheduler thread for every
+# CHUNK_READY / KV_STATUS; CPython's 5 ms default switch interval stalls it.
+DECODE_GIL_SWITCH_INTERVAL_S = 0.0005
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -422,6 +427,9 @@ class CommonKVManager(BaseKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            sys.setswitchinterval(
+                min(sys.getswitchinterval(), DECODE_GIL_SWITCH_INTERVAL_S)
+            )
             self.enable_staging: bool = False
             self._staging_handler = None
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
