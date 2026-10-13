@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     PrefillStagingContext,
 )
 from sglang.srt.disaggregation.common.utils import pack_int_lists
+from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -1172,6 +1173,23 @@ class TestStagingChunkArrival(CustomTestCase):
         self.assertFalse(handler.handle_chunk_arrived(11, 3, 8, 4, 0))
 
         handler.submit_chunk_scatter.assert_called_once_with(11, 3, 8, 4)
+
+
+class TestDecodeAdvanceStaging(CustomTestCase):
+    def test_applies_signals_and_advances_only_unfinished_staging_rooms(self):
+        queue = object.__new__(DecodeTransferQueue)
+        queue.enable_staging = True
+        queue.staging_handler = MagicMock()
+        staged = SimpleNamespace(kv_receiver=SimpleNamespace(require_staging=True))
+        direct = SimpleNamespace(kv_receiver=SimpleNamespace(require_staging=False))
+        finished = SimpleNamespace(kv_receiver=SimpleNamespace(require_staging=True))
+        queue.staging_handler.is_done.side_effect = lambda req: req is finished
+        queue.queue = [staged, direct, finished]
+
+        queue.advance_staging()
+
+        queue.staging_handler.kv_manager.drain_decode_control_messages.assert_called_once()
+        queue.staging_handler.advance_scatter.assert_called_once_with(staged)
 
 
 class TestNixlNodeFailure(CustomTestCase):

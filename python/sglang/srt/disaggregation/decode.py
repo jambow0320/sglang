@@ -2593,6 +2593,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             metadata_buffers=self.metadata_buffers,
         )
 
+    def advance_staging(self) -> None:
+        """Apply arrived chunk signals and retire finished scatters between polls."""
+        if not self.enable_staging or not self.queue:
+            return
+        self.staging_handler.kv_manager.drain_decode_control_messages()
+        for decode_req in self.queue:
+            if (
+                decode_req.kv_receiver.require_staging
+                and not self.staging_handler.is_done(decode_req)
+            ):
+                self.staging_handler.advance_scatter(decode_req)
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -2940,6 +2952,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
                 self.on_idle()
+            # Scatters launched by this iteration's poll have usually finished by
+            # now; retiring them here frees their staging slots an iteration earlier.
+            self.disagg_decode_transfer_queue.advance_staging()
 
             # Update last_batch
             self.last_batch = batch
@@ -3001,6 +3016,9 @@ class SchedulerDisaggregationDecodeMixin:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
+            # Scatters launched by this iteration's poll have usually finished by
+            # now; retiring them here frees their staging slots an iteration earlier.
+            self.disagg_decode_transfer_queue.advance_staging()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
