@@ -4,7 +4,6 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
-import sys
 import threading
 import time
 from collections import defaultdict
@@ -44,6 +43,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.common.utils import AuxDataCodec
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -71,10 +71,9 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
-
-# The decode control thread takes the GIL from the busy scheduler thread for every
-# CHUNK_READY / KV_STATUS; CPython's 5 ms default switch interval stalls it.
-DECODE_GIL_SWITCH_INTERVAL_S = 0.0005
+# [tag, room, dst_aux_index, one frame per aux buffer]; precedes the room's
+# KV_STATUS on the same socket.
+AUX_DATA_TAG = b"AUX"
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -293,6 +292,9 @@ class CommonKVManager(BaseKVManager):
     # ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
+    # Decode receiver polls apply control messages on the scheduler thread. A
+    # backend that reads the socket in its own thread keeps this False.
+    drains_decode_control_in_poll: bool = False
     sender_trace_module: Optional[str] = None
 
     dsv41_spec_layout: Optional[dict] = None
@@ -427,9 +429,6 @@ class CommonKVManager(BaseKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            sys.setswitchinterval(
-                min(sys.getswitchinterval(), DECODE_GIL_SWITCH_INTERVAL_S)
-            )
             self.enable_staging: bool = False
             self._staging_handler = None
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -772,6 +771,51 @@ class CommonKVManager(BaseKVManager):
             na = NetworkAddress(endpoint, port)
             self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
 
+    def send_aux_data(
+        self,
+        *,
+        endpoint: str,
+        dst_port: int,
+        room: int,
+        prefill_aux_index: int,
+        dst_aux_index: int,
+    ) -> None:
+        """Send a request's aux buffers to decode over the control socket."""
+        parts = [
+            AUX_DATA_TAG,
+            str(room).encode("ascii"),
+            str(dst_aux_index).encode("ascii"),
+        ]
+        for ptr, item_len in zip(
+            self.kv_args.aux_data_ptrs, self.kv_args.aux_item_lens
+        ):
+            parts.append(
+                AuxDataCodec.serialize_data_from_buffer(
+                    ptr + item_len * prefill_aux_index, item_len
+                )
+            )
+        na = NetworkAddress(endpoint, dst_port)
+        self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+
+    def _apply_aux_data(self, msg: List[bytes]) -> None:
+        try:
+            room = int(msg[1].decode("ascii"))
+            aux_index = int(msg[2].decode("ascii"))
+        except (IndexError, ValueError, UnicodeDecodeError):
+            logger.warning("Dropping malformed aux data message")
+            return
+        if room not in self.request_status:
+            return
+        frames = msg[3:]
+        item_lens = self.kv_args.aux_item_lens
+        if [len(frame) for frame in frames] != list(item_lens):
+            logger.warning("Dropping aux data for room %s with a layout mismatch", room)
+            return
+        for buffer_index, data in enumerate(frames):
+            AuxDataCodec.deserialize_data_to_buffer(
+                self.kv_args, buffer_index, aux_index, data
+            )
+
     def handle_chunk_ready(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != b"CHUNK_READY":
             return False
@@ -791,6 +835,40 @@ class CommonKVManager(BaseKVManager):
             return True
         handler.handle_chunk_arrived(room, chunk_idx, page_start, num_pages, writer_id)
         return True
+
+    def handle_decode_control_message(self, msg: List[bytes]) -> bool:
+        """Apply one prefill->decode control message; False for an unknown tag."""
+        if self.handle_chunk_ready(msg):
+            return True
+        if msg[0] == AUX_DATA_TAG:
+            self._apply_aux_data(msg)
+            return True
+        if msg[0] == b"STAGING_REQ":
+            if self.enable_staging:
+                self._handle_staging_req(msg)
+            return True
+        if self.handle_abort_ack_message(msg):
+            return True
+        parsed = self.parse_kv_status_message(msg)
+        if parsed is None:
+            return False
+        room, status, prefill_rank, reason = parsed
+        self.apply_prefill_status(
+            bootstrap_room=room,
+            status=status,
+            prefill_rank=prefill_rank,
+            failure_reason=reason,
+        )
+        return True
+
+    def drain_decode_control_messages(self) -> None:
+        """Apply every queued prefill->decode control message without blocking."""
+        if not self.drains_decode_control_in_poll:
+            return
+        while self.server_socket.poll(0):
+            msg = self.server_socket.recv_multipart(zmq.NOBLOCK)
+            if not self.handle_decode_control_message(msg):
+                logger.warning("Unexpected decode control message tag %s", msg[0][:20])
 
     def conclude_transfer(
         self,
@@ -954,6 +1032,7 @@ class CommonKVManager(BaseKVManager):
 
     def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
         """True once every prefill rank that could still write these pages has acked."""
+        self.drain_decode_control_messages()
         state = self._deferred_abort_ack_tracker.get(bootstrap_room)
         acks = state.prefill_ranks if state is not None else ()
         return len(acks) >= required_acks
@@ -2308,6 +2387,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort()
 
     def poll(self) -> KVPoll:
+        self.kv_mgr.drain_decode_control_messages()
         with self._lifecycle_lock:
             return self._poll()
 

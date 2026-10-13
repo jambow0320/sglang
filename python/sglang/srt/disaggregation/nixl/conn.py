@@ -388,6 +388,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
     kv_status_msg_carries_reason = True
+    drains_decode_control_in_poll = True
     # ABORT handler defers the ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
     # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
@@ -515,7 +516,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             if self.enable_staging:
                 self._init_staging_decode_ctx()
-            self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -583,41 +583,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
-
-    def _start_decode_listener_thread(self):
-        """Decode-side ZMQ listener for KV_STATUS, CHUNK_READY, STAGING_REQ and
-        ABORT_ACK.
-
-        Started unconditionally: KV_STATUS carries prefill-side transfer results,
-        which are independent of staging and deferred KV release."""
-
-        def decode_listener_thread():
-            while True:
-                msg = self.server_socket.recv_multipart()
-                if self.handle_chunk_ready(msg):
-                    continue
-                if msg[0] == b"STAGING_REQ":
-                    if self.enable_staging:
-                        self._handle_staging_req(msg)
-                    continue
-                if self.handle_abort_ack_message(msg):
-                    continue
-                parsed = self.parse_kv_status_message(msg)
-                if parsed is not None:
-                    room, status, prefill_rank, reason = parsed
-                    self.apply_prefill_status(
-                        bootstrap_room=room,
-                        status=status,
-                        prefill_rank=prefill_rank,
-                        failure_reason=reason,
-                    )
-                    continue
-                logger.warning(
-                    "decode_listener_thread: unexpected message tag %s",
-                    msg[0][:20],
-                )
-
-        threading.Thread(target=decode_listener_thread, daemon=True).start()
 
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
@@ -1397,38 +1362,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 staged_handle = kv_xfer_handle
 
                     if kv_chunk.is_last_chunk:
-                        dst_info = self.decode_kv_args_table[req.agent_name]
-                        if kv_chunk.state_indices:
-                            state_xfer_handles = self.maybe_send_extra(
-                                req.agent_name,
-                                kv_chunk.state_indices,
-                                dst_info.dst_state_data_ptrs,
-                                req.dst_state_indices,
-                                dst_info.gpu_id,
-                                decode_tp_size,
-                                decode_tp_rank=dst_info.decode_tp_rank,
-                                dst_state_item_lens=dst_info.dst_state_item_lens,
-                                dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
-                                dst_state_layer_ids=dst_info.dst_state_layer_ids,
-                            )
-                            handles.extend(
-                                h for h in state_xfer_handles if h is not None
-                            )
-
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
-                        aux_xfer_handle = self.send_aux(
-                            req.agent_name,
-                            kv_chunk.prefill_aux_index,
-                            dst_info.dst_aux_ptrs,
-                            req.dst_aux_index,
+                        # Aux bytes go over ZMQ: with LIBFABRIC, a staged write
+                        # posted beside the aux write could stay unfinished.
+                        self.send_aux_data(
+                            endpoint=req.endpoint,
+                            dst_port=req.dst_port,
+                            room=room,
+                            prefill_aux_index=kv_chunk.prefill_aux_index,
+                            dst_aux_index=req.dst_aux_index,
                         )
-                        handles.append(aux_xfer_handle)
 
                     if staged_handle is not None:
                         # The next peer may gather into the same source staging
-                        # buffer, and decode may only scatter a landed write. The
-                        # aux/state writes above are posted first so they overlap it.
+                        # buffer, and decode may only scatter a landed write.
                         settled, failed = self._await_handles(
                             [staged_handle], failure_seen=False
                         )
@@ -1450,6 +1398,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             last_chunk_ready.append(chunk_ready)
                         else:
                             self.send_chunk_ready(**chunk_ready)
+
+                    if kv_chunk.is_last_chunk and kv_chunk.state_indices:
+                        dst_info = self.decode_kv_args_table[req.agent_name]
+                        state_xfer_handles = self.maybe_send_extra(
+                            req.agent_name,
+                            kv_chunk.state_indices,
+                            dst_info.dst_state_data_ptrs,
+                            req.dst_state_indices,
+                            dst_info.gpu_id,
+                            decode_tp_size,
+                            decode_tp_rank=dst_info.decode_tp_rank,
+                            dst_state_item_lens=dst_info.dst_state_item_lens,
+                            dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                            dst_state_layer_ids=dst_info.dst_state_layer_ids,
+                        )
+                        handles.extend(h for h in state_xfer_handles if h is not None)
 
                 # Raise only once every handle of this batch settled, not on the
                 # first ERR: a sibling still in PROC keeps writing into the
@@ -2263,42 +2227,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"chunked_prefill_size."
             )
         return (handle, False, chunk_idx)
-
-    def send_aux(
-        self,
-        peer_name: str,
-        prefill_aux_index: int,
-        dst_aux_ptrs: list[int],
-        dst_aux_index: int,
-    ):
-        src_addrs = []
-        dst_addrs = []
-
-        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
-        prefill_aux_item_lens = self.kv_args.aux_item_lens
-
-        for i, _ in enumerate(dst_aux_ptrs):
-            length = prefill_aux_item_lens[i]
-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
-            src_addrs.append((src_addr, length, 0))
-            dst_addrs.append((dst_addr, length, 0))
-
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
-        )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
-        return xfer_handle
 
     def _send_slot_state(
         self,
