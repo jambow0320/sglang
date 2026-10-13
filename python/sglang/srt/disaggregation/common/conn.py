@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import dataclasses
 import logging
 import threading
@@ -71,8 +72,8 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
-# [tag, room, dst_aux_index, one frame per aux buffer]; precedes the room's
-# KV_STATUS on the same socket.
+# [tag, room, dst_aux_index, every aux buffer's item back to back]; precedes the
+# room's KV_STATUS on the same socket.
 AUX_DATA_TAG = b"AUX"
 
 
@@ -781,19 +782,18 @@ class CommonKVManager(BaseKVManager):
         dst_aux_index: int,
     ) -> None:
         """Send a request's aux buffers to decode over the control socket."""
+        payload = b"".join(
+            ctypes.string_at(ptr + item_len * prefill_aux_index, item_len)
+            for ptr, item_len in zip(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_item_lens
+            )
+        )
         parts = [
             AUX_DATA_TAG,
             str(room).encode("ascii"),
             str(dst_aux_index).encode("ascii"),
+            payload,
         ]
-        for ptr, item_len in zip(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_item_lens
-        ):
-            parts.append(
-                AuxDataCodec.serialize_data_from_buffer(
-                    ptr + item_len * prefill_aux_index, item_len
-                )
-            )
         na = NetworkAddress(endpoint, dst_port)
         self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
 
@@ -801,20 +801,25 @@ class CommonKVManager(BaseKVManager):
         try:
             room = int(msg[1].decode("ascii"))
             aux_index = int(msg[2].decode("ascii"))
+            payload = msg[3]
         except (IndexError, ValueError, UnicodeDecodeError):
             logger.warning("Dropping malformed aux data message")
             return
         if room not in self.request_status:
             return
-        frames = msg[3:]
         item_lens = self.kv_args.aux_item_lens
-        if [len(frame) for frame in frames] != list(item_lens):
+        if len(msg) != 4 or len(payload) != sum(item_lens):
             logger.warning("Dropping aux data for room %s with a layout mismatch", room)
             return
-        for buffer_index, data in enumerate(frames):
+        offset = 0
+        for buffer_index, item_len in enumerate(item_lens):
             AuxDataCodec.deserialize_data_to_buffer(
-                self.kv_args, buffer_index, aux_index, data
+                self.kv_args,
+                buffer_index,
+                aux_index,
+                payload[offset : offset + item_len],
             )
+            offset += item_len
 
     def handle_chunk_ready(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != b"CHUNK_READY":

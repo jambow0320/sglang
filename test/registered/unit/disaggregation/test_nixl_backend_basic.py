@@ -1127,7 +1127,8 @@ class TestNixlDecodeControlDrain(CustomTestCase):
         mgr = self._make_manager([])
         dst_bufs, mgr.kv_args = self._aux_buffers()
         mgr.update_status(11, KVPoll.WaitingForInput)
-        mgr.server_socket.messages = [[b"AUX", b"11", b"0", b"\x01" * 12]]
+        # One byte short of the 12 + 8 byte layout.
+        mgr.server_socket.messages = [[b"AUX", b"11", b"0", b"\x01" * 19]]
 
         mgr.drain_decode_control_messages()
 
