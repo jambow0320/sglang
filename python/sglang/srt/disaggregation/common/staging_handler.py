@@ -416,7 +416,11 @@ class DecodeStagingHandler:
         torch.cuda.set_device(device)
 
         if self.staging_allocator._scatter_stream is None:
-            self.staging_allocator._scatter_stream = torch.cuda.Stream(device=device)
+            # Above the forward's priority: the staging slot stays held until the
+            # scatter finishes, and decode kernels would otherwise delay it.
+            self.staging_allocator._scatter_stream = torch.cuda.Stream(
+                device=device, priority=-1
+            )
 
         scatter_stream = self.staging_allocator._scatter_stream
 

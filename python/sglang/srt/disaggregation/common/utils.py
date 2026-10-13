@@ -102,9 +102,7 @@ class AuxDataCodec:
         dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
         item_len = kv_args.aux_item_lens[buffer_index]
         dst_addr = dst_aux_ptr + item_len * aux_index
-        buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
-        buffer[:] = data
-        return
+        ctypes.memmove(dst_addr, data, len(data))
 
 
 def group_concurrent_contiguous(
